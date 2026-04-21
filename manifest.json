@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Anchrd Tabs - Open Next to Current",
+  "version": "1.0.2",
+  "description": "Open new tabs next to the current one, not at the end of the strip. Per-trigger rules for link clicks, Ctrl+T, and Ctrl+Shift+T.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["tabs", "storage", "sessions"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    },
+    "default_popup": "options.html",
+    "default_title": "Anchrd Tabs settings"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
