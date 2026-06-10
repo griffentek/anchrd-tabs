@@ -78,11 +78,16 @@ async function initWindowState() {
     const winId = Number(wid);
     const active = wTabs.find(t => t.active);
     if (!active) continue;
-    activeTab[winId] = active.id;
-    // Seed history: active tab first, then others in descending index order
-    // (rightmost = most recently opened is a reasonable heuristic).
-    const others = wTabs.filter(t => !t.active).sort((a, b) => b.index - a.index);
-    lastUsed[winId] = [active.id, ...others.map(t => t.id)];
+    activeTab[winId] ??= active.id;
+    // Seed history: active tab first, then others by real recency — Chrome tracks
+    // when each tab was last active (tab.lastAccessed, Chrome 121+). Fall back to
+    // descending index (rightmost = most recently opened) where it's missing.
+    // Merge under anything an event handler has already recorded for this window.
+    const others = wTabs.filter(t => !t.active)
+      .sort((a, b) => ((b.lastAccessed ?? 0) - (a.lastAccessed ?? 0)) || (b.index - a.index));
+    const seed = [active.id, ...others.map(t => t.id)];
+    const live = lastUsed[winId] ?? [];
+    lastUsed[winId] = [...live, ...seed.filter(id => !live.includes(id))].slice(0, 20);
   }
 }
 
@@ -95,6 +100,16 @@ const lastUsed   = {};   // windowId -> tabId[] most-recent-first, capped at 20
 const activeTab  = {};   // windowId -> tabId currently active
 const openerOf   = {};   // tabId -> openerTabId
 const tabIdx     = {};   // tabId -> last known index (updated on create + move)
+const linkUrl    = {};   // tabId -> URL the tab was opened to load; lets preventDuplicates
+                         // match tabs whose URL changed after open (redirects, SPA rewrites)
+
+const lastAct    = {};   // windowId -> { tabId, prevActive, at } most recent onActivated;
+                         // used to detect Chrome's auto-activation racing ahead of onRemoved
+const settled    = new Set(); // tabIds that completed their first load (in-memory only)
+const selfClosed = new Set(); // tabIds the extension removed itself (dedup) — their
+                              // onRemoved must not run close-activation logic
+const pendingLink = new Map(); // tabId -> createdAt, for opener-created tabs with no URL yet
+                               // (target=_blank / window.open: the URL arrives at first commit)
 
 let restoredAt = 0;      // timestamp of last chrome.sessions.onChanged
 
@@ -102,8 +117,13 @@ const STATE_KEY = '__anchrd_state';
 
 // Written on every state change. session storage is in-memory and survives worker
 // restarts within a browser session, so it always holds the latest snapshot.
+// No-op until hydration has merged the previous snapshot in — a handler running
+// on a freshly woken worker must not overwrite the full snapshot with the one or
+// two entries it has written so far.
+let hydrated = false;
 function persistState() {
-  chrome.storage.session.set({ [STATE_KEY]: { lastUsed, activeTab, openerOf, tabIdx } }).catch(() => {});
+  if (!hydrated) return;
+  chrome.storage.session.set({ [STATE_KEY]: { lastUsed, activeTab, openerOf, tabIdx, linkUrl } }).catch(() => {});
 }
 
 async function readPersistedState() {
@@ -121,17 +141,24 @@ async function hydrateState() {
   bootState = await readPersistedState();
   const hasState = Object.keys(bootState.activeTab ?? {}).length > 0;
   if (hasState) {
-    // Warm restart within the browser session — restore the live maps. Per-map
-    // guards avoid clobbering anything a concurrent event has already written.
-    if (Object.keys(lastUsed).length === 0)  Object.assign(lastUsed,  bootState.lastUsed  ?? {});
-    if (Object.keys(activeTab).length === 0) Object.assign(activeTab, bootState.activeTab ?? {});
-    if (Object.keys(openerOf).length === 0)  Object.assign(openerOf,  bootState.openerOf  ?? {});
-    if (Object.keys(tabIdx).length === 0)    Object.assign(tabIdx,    bootState.tabIdx    ?? {});
+    // Warm restart within the browser session — merge the snapshot UNDER anything
+    // the waking event's handler has already written. (An all-or-nothing guard here
+    // would drop the whole MRU history whenever a tab switch woke the worker: that
+    // onActivated runs before this read resolves and leaves a one-entry stack.)
+    for (const [w, stack] of Object.entries(bootState.lastUsed ?? {})) {
+      const live = lastUsed[w] ?? [];
+      lastUsed[w] = [...live, ...stack.filter(id => !live.includes(id))].slice(0, 20);
+    }
+    for (const [w, id] of Object.entries(bootState.activeTab ?? {})) if (!(w in activeTab)) activeTab[w] = id;
+    for (const [k, v] of Object.entries(bootState.openerOf ?? {}))   if (!(k in openerOf))  openerOf[k]  = v;
+    for (const [k, v] of Object.entries(bootState.tabIdx ?? {}))     if (!(k in tabIdx))    tabIdx[k]    = v;
+    for (const [k, v] of Object.entries(bootState.linkUrl ?? {}))    if (!(k in linkUrl))   linkUrl[k]   = v;
   } else {
     // Genuine fresh start (new browser session) — seed from the current tab list.
     await initWindowState();
-    bootState = { lastUsed, activeTab, openerOf, tabIdx };
+    bootState = { lastUsed, activeTab, openerOf, tabIdx, linkUrl };
   }
+  hydrated = true;
   persistState();
 }
 
@@ -144,6 +171,12 @@ chrome.storage.onChanged.addListener((_changes, area) => { if (area === 'sync') 
 
 chrome.tabs.onActivated.addListener(({ tabId, windowId }) => {
   dlog('onActivated', { tabId, windowId, prevActive: activeTab[windowId], stackBefore: [...(lastUsed[windowId] ?? [])] });
+  lastAct[windowId] = {
+    tabId, prevActive: activeTab[windowId], at: Date.now(),
+    // Pre-activation stack snapshot: if this activation turns out to be Chrome's
+    // auto-replacement racing ahead of onRemoved, this is the state to restore.
+    stackBefore: [...(lastUsed[windowId] ?? [])],
+  };
   activeTab[windowId] = tabId;
   lastUsed[windowId] = [tabId, ...(lastUsed[windowId] ?? []).filter(id => id !== tabId)].slice(0, 20);
   persistState();
@@ -167,6 +200,36 @@ function classify(tab) {
   if (tab.openerTabId != null && isWebURL) return 'linkClick';
   if (Date.now() - restoredAt < 150) return 'reopened';
   return 'blankNewTab';
+}
+
+// Comparison form for dedup: drop the fragment and any trailing slash so
+// cosmetic differences don't defeat the match.
+function normUrl(u) {
+  if (!u) return '';
+  try {
+    const x = new URL(u);
+    x.hash = '';
+    const s = x.href;
+    return s.endsWith('/') ? s.slice(0, -1) : s;
+  } catch { return u; }
+}
+
+// If a tab matching `url` is already open in the same window, switch to it and
+// close `tab`. Matches each candidate's current URL, in-flight URL, and the URL
+// it was originally opened to load (so server redirects and SPA URL rewrites
+// don't hide the duplicate). Returns true if the new tab was collapsed.
+async function collapseDuplicate(tab, url) {
+  const target = normUrl(url);
+  if (!target || url === NTP) return false;
+  const all = await chrome.tabs.query({ windowId: tab.windowId });
+  const dupe = all.find(t => t.id !== tab.id &&
+    (normUrl(t.url) === target || normUrl(t.pendingUrl) === target || normUrl(linkUrl[t.id]) === target));
+  if (!dupe) return false;
+  selfClosed.add(tab.id); // this activate+remove pair would otherwise look exactly
+                          // like Chrome's auto-activation race to onRemoved
+  await chrome.tabs.update(dupe.id, { active: true });
+  await chrome.tabs.remove(tab.id);
+  return true;
 }
 
 async function safeMove(tabId, index) {
@@ -210,27 +273,32 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   tabIdx[tab.id] = tab.index;
   if (tab.openerTabId != null) openerOf[tab.id] = tab.openerTabId;
   // Capture the previously active tab now, before Chrome fires onActivated for the new tab
-  const prevActiveId = activeTab[tab.windowId];
+  let prevActiveId = activeTab[tab.windowId];
   persistState();
 
   await Promise.all([cfgReady, stateReady]);
   if (!cfg.enabled) return;
 
-  const trigger = classify(tab);
-  dlog('onCreated', { tabId: tab.id, windowId: tab.windowId, opener: tab.openerTabId, index: tab.index, trigger, prevActiveId });
+  // On a cold wake the pre-await read was empty; the hydrated maps know better.
+  if (prevActiveId == null) {
+    const merged = activeTab[tab.windowId];
+    prevActiveId = merged !== tab.id ? merged
+      : (lastUsed[tab.windowId] ?? []).find(id => id !== tab.id);
+  }
 
-  // Deduplicate: if an identical URL is already open, switch to it and close the new tab
-  if (cfg.preventDuplicates && trigger === 'linkClick') {
+  const trigger = classify(tab);
+  dlog('onCreated', { tabId: tab.id, windowId: tab.windowId, opener: tab.openerTabId, index: tab.index, trigger, prevActiveId, url: tab.pendingUrl ?? tab.url });
+
+  if (trigger === 'linkClick') {
     const url = tab.pendingUrl ?? tab.url;
-    if (url && url !== NTP) {
-      const all = await chrome.tabs.query({ windowId: tab.windowId });
-      const dupe = all.find(t => t.id !== tab.id && (t.url === url || t.pendingUrl === url));
-      if (dupe) {
-        await chrome.tabs.update(dupe.id, { active: true });
-        await chrome.tabs.remove(tab.id);
-        return;
-      }
-    }
+    linkUrl[tab.id] = url;
+    persistState();
+    // Deduplicate: if an identical URL is already open, switch to it and close the new tab
+    if (cfg.preventDuplicates && (await collapseDuplicate(tab, url))) return;
+  } else if (tab.openerTabId != null && tab.pendingUrl == null && (!tab.url || tab.url === 'about:blank')) {
+    // target=_blank / window.open: the tab is created blank and its URL only
+    // arrives at the first navigation commit — handled in onUpdated below.
+    pendingLink.set(tab.id, Date.now());
   }
 
   // Positioning — for linkClick use opener; for blankNewTab, openerTabId is the tab
@@ -262,25 +330,85 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener(async (tabId, { windowId, isWindowClosing }) => {
-  // Warm path: read the live in-memory maps synchronously, before Chrome's
-  // onActivated for its auto-chosen replacement can mutate them.
-  let stack       = lastUsed[windowId] ?? [];
-  let active      = activeTab[windowId];
-  let savedIdx    = tabIdx[tabId];
-  let savedOpener = openerOf[tabId];
+// First-commit handling for tabs created blank (target=_blank / window.open),
+// plus origin-URL upkeep for the dedup matcher.
+chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  if (info.url) {
+    const created = pendingLink.get(tabId);
+    if (created != null) {
+      pendingLink.delete(tabId);
+      // Only trust commits arriving soon after creation — a slow first commit is
+      // more likely a user-initiated navigation in a blank tab than the link load.
+      if (Date.now() - created < 10_000 && /^(https?|file):/.test(info.url)) {
+        linkUrl[tabId] = info.url;
+        persistState();
+        await Promise.all([cfgReady, stateReady]);
+        if (cfg.enabled && cfg.preventDuplicates) {
+          dlog('onUpdated first-commit dedup check', { tabId, url: info.url });
+          await collapseDuplicate(tab, info.url);
+        }
+      }
+    } else if (settled.has(tabId) && linkUrl[tabId] && normUrl(info.url) !== normUrl(linkUrl[tabId])) {
+      // The tab navigated somewhere new after its first load finished — its
+      // origin URL no longer describes what it shows.
+      delete linkUrl[tabId];
+      persistState();
+    }
+  }
+  if (info.status === 'complete') settled.add(tabId);
+});
 
-  // Cold start: the worker was terminated while idle and woken by THIS close, so the
-  // live maps are empty. Recover the pre-close snapshot captured at startup from
-  // storage.session (untouched while the worker slept). This is the fix for the
-  // intermittent "jumps to the rightmost tab" bug.
-  const coldStart = stack.length === 0 && active == null;
-  if (coldStart) {
+chrome.tabs.onRemoved.addListener(async (tabId, { windowId, isWindowClosing }) => {
+  // Captured before any await: the race check below compares this against the
+  // last activation's timestamp. Cold-start storage reads can take hundreds of
+  // milliseconds — measuring after them would make a genuine auto-activation
+  // race look stale.
+  const arrivedAt = Date.now();
+
+  // A close the extension performed itself (dedup collapse): clean up state but
+  // run no close-activation logic — the focus switch to the surviving duplicate
+  // has already been made deliberately.
+  if (selfClosed.delete(tabId)) {
     await stateReady;
-    stack       = bootState.lastUsed?.[windowId] ?? [];
-    active      = bootState.activeTab?.[windowId];
-    savedIdx    = bootState.tabIdx?.[tabId];
-    savedOpener = bootState.openerOf?.[tabId];
+    delete openerOf[tabId];
+    delete tabIdx[tabId];
+    delete linkUrl[tabId];
+    settled.delete(tabId);
+    pendingLink.delete(tabId);
+    if (lastUsed[windowId]) lastUsed[windowId] = lastUsed[windowId].filter(id => id !== tabId);
+    persistState();
+    dlog('onRemoved -> self-closed (dedup), no redirect', { tabId, windowId });
+    return;
+  }
+
+  // Make sure settings are loaded and the persisted snapshot has been merged into
+  // the live maps before reading them — on a close that wakes a cold worker, this
+  // resolves with the pre-close state (the first storage read is queued before any
+  // handler write can clobber it).
+  await Promise.all([cfgReady, stateReady]);
+
+  let stack        = lastUsed[windowId] ?? [];
+  let active       = activeTab[windowId];
+  const savedIdx    = tabIdx[tabId];
+  const savedOpener = openerOf[tabId];
+
+  // Event-order race: on some machines Chrome dispatches onActivated for its
+  // auto-chosen replacement BEFORE onRemoved (warm or as a cold-wake pair). That
+  // makes the closed tab look inactive and leaves Chrome's pick (the right-hand
+  // neighbour) in place. Detect the pattern — the current active tab was activated
+  // milliseconds ago, displacing the tab now being closed — and undo it.
+  const la = lastAct[windowId];
+  const autoRace = active !== tabId && la != null && active === la.tabId && stack[0] === la.tabId
+    && (la.prevActive === tabId || (la.prevActive == null && bootState.activeTab?.[windowId] === tabId))
+    && arrivedAt - la.at < 250;
+  if (autoRace) {
+    // Restore the stack as it was BEFORE the auto-activation — Chrome's pick keeps
+    // its legitimate MRU position (it is often the true last-used tab, e.g. the
+    // opener; simply deleting it would bounce the redirect to the wrong tab).
+    // On a cold wake the activation ran pre-hydration with an empty stack, so the
+    // pre-race state is the boot snapshot.
+    stack = la.stackBefore.includes(tabId) ? la.stackBefore : (bootState.lastUsed?.[windowId] ?? []);
+    active = tabId;
   }
 
   const closedPos = stack.indexOf(tabId);
@@ -289,21 +417,27 @@ chrome.tabs.onRemoved.addListener(async (tabId, { windowId, isWindowClosing }) =
   // history stack (Chrome's onActivated hasn't fired yet for the replacement).
   const wasActive = active === tabId || closedPos === 0;
 
-  // "Last used" = the tab that was active just before this one: the next entry in
-  // the history stack. Snapshot the cleaned stack now for the redirect below.
-  const lastUsedTargetId = closedPos >= 0 ? stack[closedPos + 1] : undefined;
+  // "Last used" = the tab that was active just before this one: the entries after
+  // it in the history stack, best first. If the closed tab isn't in the stack at
+  // all (degraded state) but we still know it was active, every known entry is a
+  // better guess than the by-index fallback (the right-hand neighbour). Snapshot
+  // the cleaned stack now for the redirect below.
   const cleanStack = stack.filter(id => id !== tabId);
+  const luCandidates = closedPos >= 0 ? stack.slice(closedPos + 1) : cleanStack;
 
   dlog('onRemoved', {
-    tabId, windowId, isWindowClosing, coldStart,
+    tabId, windowId, isWindowClosing, autoRace,
     active, stack: [...stack], closedPos, wasActive,
-    lastUsedTargetId, savedIdx, savedOpener,
+    luCandidates, savedIdx, savedOpener,
     rule: cfg.onClose.activate, enabled: cfg.enabled,
   });
 
   // Drop the closed tab from the live maps and persist the cleaned snapshot.
   delete openerOf[tabId];
   delete tabIdx[tabId];
+  delete linkUrl[tabId];
+  settled.delete(tabId);
+  pendingLink.delete(tabId);
   if (lastUsed[windowId]) lastUsed[windowId] = lastUsed[windowId].filter(id => id !== tabId);
   persistState();
 
@@ -320,7 +454,12 @@ chrome.tabs.onRemoved.addListener(async (tabId, { windowId, isWindowClosing }) =
     let target;
 
     if (rule === 'last-used') {
-      target = remaining.find(t => t.id === lastUsedTargetId);
+      // Walk the history stack for the first candidate still open — entries can be
+      // dead if their tabs closed in quick succession.
+      for (const id of luCandidates) {
+        target = remaining.find(t => t.id === id);
+        if (target) break;
+      }
       if (target) {
         // Restore the clean stack before activating — Chrome's intermediate auto-activation
         // will have inserted an extra tab at position 1, which would corrupt the next close.
@@ -346,7 +485,7 @@ chrome.tabs.onRemoved.addListener(async (tabId, { windowId, isWindowClosing }) =
       });
     }
 
-    dlog('redirect -> activate', { rule, lastUsedTargetId, primaryId, finalTargetId: target?.id, activeNow: activeTab[windowId] });
+    dlog('redirect -> activate', { rule, luCandidates, primaryId, finalTargetId: target?.id, activeNow: activeTab[windowId] });
     if (target) {
       try { await chrome.tabs.update(target.id, { active: true }); } catch {}
     }
