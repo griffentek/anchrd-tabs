@@ -204,6 +204,10 @@ function classify(tab) {
   // so checking for a real web URL is more robust than matching specific NTP strings.
   const isWebURL = url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
   if (tab.openerTabId != null && isWebURL) return 'linkClick';
+  // Firefox has no tab.pendingUrl: ALL link-created tabs (middle-click,
+  // target=_blank, window.open) arrive blank with an opener, and Ctrl+T tabs
+  // carry no opener there — so opener+blank reliably means a link click.
+  if (IS_FIREFOX && tab.openerTabId != null && (!url || url === 'about:blank')) return 'linkClick';
   if (Date.now() - restoredAt < 150) return 'reopened';
   return 'blankNewTab';
 }
@@ -297,10 +301,16 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 
   if (trigger === 'linkClick') {
     const url = tab.pendingUrl ?? tab.url;
-    linkUrl[tab.id] = url;
-    persistState();
-    // Deduplicate: if an identical URL is already open, switch to it and close the new tab
-    if (cfg.preventDuplicates && (await collapseDuplicate(tab, url))) return;
+    if (/^(https?|file):/.test(url ?? '')) {
+      linkUrl[tab.id] = url;
+      persistState();
+      // Deduplicate: if an identical URL is already open, switch to it and close the new tab
+      if (cfg.preventDuplicates && (await collapseDuplicate(tab, url))) return;
+    } else {
+      // Firefox link click: created blank, URL arrives at first commit —
+      // same deferred handling as target=_blank tabs (onUpdated below).
+      pendingLink.set(tab.id, Date.now());
+    }
   } else if (tab.openerTabId != null && tab.pendingUrl == null && (!tab.url || tab.url === 'about:blank')) {
     // target=_blank / window.open: the tab is created blank and its URL only
     // arrives at the first navigation commit — handled in onUpdated below.
