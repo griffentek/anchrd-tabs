@@ -336,7 +336,8 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   }
 
   // Move new tab into opener's group if it has one
-  if (cfg.moveToOpenerGroup && tab.openerTabId != null) {
+  // chrome.tabs.group is Chrome + Firefox 138+ only — degrade silently elsewhere.
+  if (cfg.moveToOpenerGroup && tab.openerTabId != null && chrome.tabs.group) {
     try {
       const opener = await chrome.tabs.get(tab.openerTabId);
       if (opener.groupId !== NO_GROUP) {
