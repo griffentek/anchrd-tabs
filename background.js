@@ -1,4 +1,10 @@
-const NTP = 'chrome://newtab/';
+// Firefox MV3 runs this file as an event page (no service workers there); the
+// chrome.* promise API works identically. The URL scheme is the discriminator.
+const IS_FIREFOX = chrome.runtime.getURL('').startsWith('moz-extension://');
+// New-tab-page URLs: never dedup-collapse these.
+const NTP_URLS = IS_FIREFOX
+  ? ['about:newtab', 'about:home', 'about:blank']
+  : ['chrome://newtab/'];
 const NO_GROUP = -1;
 
 const DEFAULTS = {
@@ -220,7 +226,7 @@ function normUrl(u) {
 // don't hide the duplicate). Returns true if the new tab was collapsed.
 async function collapseDuplicate(tab, url) {
   const target = normUrl(url);
-  if (!target || url === NTP) return false;
+  if (!target || NTP_URLS.includes(url)) return false;
   const all = await chrome.tabs.query({ windowId: tab.windowId });
   const dupe = all.find(t => t.id !== tab.id &&
     (normUrl(t.url) === target || normUrl(t.pendingUrl) === target || normUrl(linkUrl[t.id]) === target));
