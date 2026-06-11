@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Anchrd Tabs - Open Next to Current",
-  "version": "1.0.4",
+  "version": "1.1.0",
   "description": "Open new tabs next to the current one, not at the end of the strip. Per-trigger rules for link clicks, Ctrl+T, and Ctrl+Shift+T.",
   "icons": {
     "16": "icons/icon16.png",
