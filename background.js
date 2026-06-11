@@ -44,6 +44,10 @@ function dlog(label, data) {
   }
 }
 
+// Marks every worker (re)start in the persisted logs — without it a cold wake
+// is indistinguishable from a warm handler run when reading dumpLogs() output.
+dlog('startup', { instance: INSTANCE });
+
 // Console helpers (callable from the service-worker console)
 globalThis.dumpLogs = async () => {
   const all = await chrome.storage.local.get(null);
@@ -209,12 +213,17 @@ chrome.sessions.onChanged.addListener(() => {
 // means that tab was a restore misclassified as blankNewTab. Re-apply positioning
 // under the `reopened` rule — back to its creation index for 'default'.
 async function correctLateRestore() {
+  // Age is measured at arrival — cfgReady can take hundreds of ms on a cold
+  // wake, and a genuine restore must not be dismissed as stale after the await.
+  const age = lastBlankCreate ? Date.now() - lastBlankCreate.at : null;
   const rec = lastBlankCreate;
   lastBlankCreate = null;
-  if (!rec || Date.now() - rec.at > 300) return;
   await Promise.all([cfgReady, stateReady]);
   const posReopened = cfg.positioning.reopened ?? 'default';
-  if (posReopened === (cfg.positioning.blankNewTab ?? 'default')) return; // same outcome
+  const posBlank = cfg.positioning.blankNewTab ?? 'default';
+  dlog('late-restore check', { tabId: rec?.tabId, age, posReopened, posBlank });
+  if (!rec || age > 300) return;
+  if (posReopened === posBlank) return; // same outcome either way
   dlog('late-restore correction', { tabId: rec.tabId, posReopened });
   try {
     const tab = await chrome.tabs.get(rec.tabId);
