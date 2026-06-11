@@ -118,6 +118,12 @@ const pendingLink = new Map(); // tabId -> createdAt, for opener-created tabs wi
                                // (target=_blank / window.open: the URL arrives at first commit)
 
 let restoredAt = 0;      // timestamp of last chrome.sessions.onChanged
+// Firefox dispatches sessions.onChanged AFTER the restored tab's onCreated
+// (Chrome: before), so classify() cannot see a restore there. Each opener-less
+// blank tab is recorded here so a late onChanged can re-position it under the
+// `reopened` rule. (Firefox restores arrive as about:blank; Cmd+T tabs as
+// about:newtab — so Cmd+T tabs are never recorded.)
+let lastBlankCreate = null; // { tabId, windowId, createdIndex, refId, at }
 
 const STATE_KEY = '__anchrd_state';
 
@@ -195,7 +201,34 @@ chrome.tabs.onMoved.addListener((tabId, { toIndex }) => {
 
 chrome.sessions.onChanged.addListener(() => {
   restoredAt = Date.now();
+  dlog('sessions.onChanged', {});
+  if (IS_FIREFOX) correctLateRestore();
 });
+
+// Firefox-only: sessions.onChanged arriving just after an opener-less blank tab
+// means that tab was a restore misclassified as blankNewTab. Re-apply positioning
+// under the `reopened` rule — back to its creation index for 'default'.
+async function correctLateRestore() {
+  const rec = lastBlankCreate;
+  lastBlankCreate = null;
+  if (!rec || Date.now() - rec.at > 300) return;
+  await Promise.all([cfgReady, stateReady]);
+  const posReopened = cfg.positioning.reopened ?? 'default';
+  if (posReopened === (cfg.positioning.blankNewTab ?? 'default')) return; // same outcome
+  dlog('late-restore correction', { tabId: rec.tabId, posReopened });
+  try {
+    const tab = await chrome.tabs.get(rec.tabId);
+    const idx = posReopened === 'default'
+      ? rec.createdIndex
+      : await computeTargetIndex(tab, posReopened, rec.refId);
+    await safeMove(rec.tabId, idx);
+    // blankNewTab's 'background' focus rule may have unfocused it; a restore is
+    // natively foreground and `reopened` carries no focus override.
+    if (cfg.focus.blankNewTab === 'background') {
+      await chrome.tabs.update(rec.tabId, { active: true });
+    }
+  } catch {}
+}
 
 function classify(tab) {
   const url = tab.pendingUrl ?? tab.url ?? '';
@@ -298,6 +331,11 @@ chrome.tabs.onCreated.addListener(async (tab) => {
 
   const trigger = classify(tab);
   dlog('onCreated', { tabId: tab.id, windowId: tab.windowId, opener: tab.openerTabId, index: tab.index, trigger, prevActiveId, url: tab.pendingUrl ?? tab.url });
+
+  // A restore candidate for the late sessions.onChanged correction (Firefox only).
+  if (IS_FIREFOX && trigger === 'blankNewTab' && tab.openerTabId == null && tab.url === 'about:blank') {
+    lastBlankCreate = { tabId: tab.id, windowId: tab.windowId, createdIndex: tab.index, refId: prevActiveId ?? null, at: Date.now() };
+  }
 
   if (trigger === 'linkClick') {
     const url = tab.pendingUrl ?? tab.url;
