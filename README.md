@@ -1,6 +1,6 @@
 # Anchrd Tabs
 
-A lightweight Chrome extension that gives you control over where new tabs open, what gets focus, and which tab activates when you close one.
+A lightweight browser extension that gives you control over where new tabs open, what gets focus, and which tab activates when you close one. Available for Chrome and Firefox.
 
 [Install from the Chrome Web Store](https://chromewebstore.google.com/detail/anchrd-tabs-open-next-to/gleafkjllnfkbndfiecnpcpaifigfnck)
 
@@ -20,14 +20,20 @@ Chrome's default behaviour sends every new tab to the far end of the tab strip. 
 
 The after-close behaviour is the other one most people don't know they want - Chrome's default is unpredictable. Setting it to "last used" means closing a tab always returns you to where you were.
 
+## Firefox
+
+Anchrd Tabs also works on Firefox (115+; tab-group support needs 138+).
+Install from [addons.mozilla.org](https://addons.mozilla.org/) - link TBC after first AMO review.
+
 ## Code
 
-Manifest V3, no build step, no dependencies, four files.
+Manifest V3, no build step, no dependencies.
 
 | File | Role |
 |---|---|
-| `manifest.json` | MV3 manifest |
-| `background.js` | Service worker - all tab logic |
+| `manifest.json` | MV3 manifest (Chrome) |
+| `manifest.firefox.json` | MV3 manifest (Firefox - event page, gecko settings) |
+| `background.js` | Background worker - all tab logic, shared by both browsers |
 | `options.html` | Settings panel |
 | `options.js` | Reads/writes `chrome.storage.sync` |
 

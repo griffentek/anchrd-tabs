@@ -1,4 +1,10 @@
-const NTP = 'chrome://newtab/';
+// Firefox MV3 runs this file as an event page (no service workers there); the
+// chrome.* promise API works identically. The URL scheme is the discriminator.
+const IS_FIREFOX = chrome.runtime.getURL('').startsWith('moz-extension://');
+// New-tab-page URLs: never dedup-collapse these.
+const NTP_URLS = IS_FIREFOX
+  ? ['about:newtab', 'about:home', 'about:blank']
+  : ['chrome://newtab/'];
 const NO_GROUP = -1;
 
 const DEFAULTS = {
@@ -37,6 +43,10 @@ function dlog(label, data) {
     chrome.storage.local.set({ [key]: { t: Date.now(), label, data: data ?? null } }).catch(() => {});
   }
 }
+
+// Marks every worker (re)start in the persisted logs — without it a cold wake
+// is indistinguishable from a warm handler run when reading dumpLogs() output.
+dlog('startup', { instance: INSTANCE });
 
 // Console helpers (callable from the service-worker console)
 globalThis.dumpLogs = async () => {
@@ -112,6 +122,12 @@ const pendingLink = new Map(); // tabId -> createdAt, for opener-created tabs wi
                                // (target=_blank / window.open: the URL arrives at first commit)
 
 let restoredAt = 0;      // timestamp of last chrome.sessions.onChanged
+// Firefox dispatches sessions.onChanged AFTER the restored tab's onCreated
+// (Chrome: before), so classify() cannot see a restore there. Each opener-less
+// blank tab is recorded here so a late onChanged can re-position it under the
+// `reopened` rule. (Firefox restores arrive as about:blank; Cmd+T tabs as
+// about:newtab — so Cmd+T tabs are never recorded.)
+let lastBlankCreate = null; // { tabId, windowId, createdIndex, refId, at }
 
 const STATE_KEY = '__anchrd_state';
 
@@ -189,7 +205,39 @@ chrome.tabs.onMoved.addListener((tabId, { toIndex }) => {
 
 chrome.sessions.onChanged.addListener(() => {
   restoredAt = Date.now();
+  dlog('sessions.onChanged', {});
+  if (IS_FIREFOX) correctLateRestore();
 });
+
+// Firefox-only: sessions.onChanged arriving just after an opener-less blank tab
+// means that tab was a restore misclassified as blankNewTab. Re-apply positioning
+// under the `reopened` rule — back to its creation index for 'default'.
+async function correctLateRestore() {
+  // Age is measured at arrival — cfgReady can take hundreds of ms on a cold
+  // wake, and a genuine restore must not be dismissed as stale after the await.
+  const age = lastBlankCreate ? Date.now() - lastBlankCreate.at : null;
+  const rec = lastBlankCreate;
+  lastBlankCreate = null;
+  await Promise.all([cfgReady, stateReady]);
+  const posReopened = cfg.positioning.reopened ?? 'default';
+  const posBlank = cfg.positioning.blankNewTab ?? 'default';
+  dlog('late-restore check', { tabId: rec?.tabId, age, posReopened, posBlank });
+  if (!rec || age > 300) return;
+  if (posReopened === posBlank) return; // same outcome either way
+  dlog('late-restore correction', { tabId: rec.tabId, posReopened });
+  try {
+    const tab = await chrome.tabs.get(rec.tabId);
+    const idx = posReopened === 'default'
+      ? rec.createdIndex
+      : await computeTargetIndex(tab, posReopened, rec.refId);
+    await safeMove(rec.tabId, idx);
+    // blankNewTab's 'background' focus rule may have unfocused it; a restore is
+    // natively foreground and `reopened` carries no focus override.
+    if (cfg.focus.blankNewTab === 'background') {
+      await chrome.tabs.update(rec.tabId, { active: true });
+    }
+  } catch {}
+}
 
 function classify(tab) {
   const url = tab.pendingUrl ?? tab.url ?? '';
@@ -198,6 +246,10 @@ function classify(tab) {
   // so checking for a real web URL is more robust than matching specific NTP strings.
   const isWebURL = url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
   if (tab.openerTabId != null && isWebURL) return 'linkClick';
+  // Firefox has no tab.pendingUrl: ALL link-created tabs (middle-click,
+  // target=_blank, window.open) arrive blank with an opener, and Ctrl+T tabs
+  // carry no opener there — so opener+blank reliably means a link click.
+  if (IS_FIREFOX && tab.openerTabId != null && (!url || url === 'about:blank')) return 'linkClick';
   if (Date.now() - restoredAt < 150) return 'reopened';
   return 'blankNewTab';
 }
@@ -220,7 +272,7 @@ function normUrl(u) {
 // don't hide the duplicate). Returns true if the new tab was collapsed.
 async function collapseDuplicate(tab, url) {
   const target = normUrl(url);
-  if (!target || url === NTP) return false;
+  if (!target || NTP_URLS.includes(url)) return false;
   const all = await chrome.tabs.query({ windowId: tab.windowId });
   const dupe = all.find(t => t.id !== tab.id &&
     (normUrl(t.url) === target || normUrl(t.pendingUrl) === target || normUrl(linkUrl[t.id]) === target));
@@ -289,12 +341,23 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   const trigger = classify(tab);
   dlog('onCreated', { tabId: tab.id, windowId: tab.windowId, opener: tab.openerTabId, index: tab.index, trigger, prevActiveId, url: tab.pendingUrl ?? tab.url });
 
+  // A restore candidate for the late sessions.onChanged correction (Firefox only).
+  if (IS_FIREFOX && trigger === 'blankNewTab' && tab.openerTabId == null && tab.url === 'about:blank') {
+    lastBlankCreate = { tabId: tab.id, windowId: tab.windowId, createdIndex: tab.index, refId: prevActiveId ?? null, at: Date.now() };
+  }
+
   if (trigger === 'linkClick') {
     const url = tab.pendingUrl ?? tab.url;
-    linkUrl[tab.id] = url;
-    persistState();
-    // Deduplicate: if an identical URL is already open, switch to it and close the new tab
-    if (cfg.preventDuplicates && (await collapseDuplicate(tab, url))) return;
+    if (/^(https?|file):/.test(url ?? '')) {
+      linkUrl[tab.id] = url;
+      persistState();
+      // Deduplicate: if an identical URL is already open, switch to it and close the new tab
+      if (cfg.preventDuplicates && (await collapseDuplicate(tab, url))) return;
+    } else {
+      // Firefox link click: created blank, URL arrives at first commit —
+      // same deferred handling as target=_blank tabs (onUpdated below).
+      pendingLink.set(tab.id, Date.now());
+    }
   } else if (tab.openerTabId != null && tab.pendingUrl == null && (!tab.url || tab.url === 'about:blank')) {
     // target=_blank / window.open: the tab is created blank and its URL only
     // arrives at the first navigation commit — handled in onUpdated below.
@@ -320,7 +383,8 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   }
 
   // Move new tab into opener's group if it has one
-  if (cfg.moveToOpenerGroup && tab.openerTabId != null) {
+  // chrome.tabs.group is Chrome + Firefox 138+ only — degrade silently elsewhere.
+  if (cfg.moveToOpenerGroup && tab.openerTabId != null && chrome.tabs.group) {
     try {
       const opener = await chrome.tabs.get(tab.openerTabId);
       if (opener.groupId !== NO_GROUP) {
