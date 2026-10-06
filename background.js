@@ -203,6 +203,20 @@ chrome.tabs.onMoved.addListener((tabId, { toIndex }) => {
   persistState();
 });
 
+// Browser-start session restore ("continue where you left off") recreates every
+// saved tab and fires onCreated for each, indistinguishable from a user opening
+// it. Acting on them (positioning 'right' of the active tab, which sits in the
+// first group) drags them into that group's index range and Chrome absorbs
+// them. From runtime.onStartup, onCreated only records state until the restore
+// burst has been quiet for RESTORE_QUIET_MS.
+const RESTORE_GRACE_MS = 5000;
+const RESTORE_QUIET_MS = 1500;
+let restoringUntil = 0;
+chrome.runtime.onStartup.addListener(() => {
+  restoringUntil = Date.now() + RESTORE_GRACE_MS;
+  dlog('runtime.onStartup: restore grace period', { until: restoringUntil });
+});
+
 chrome.sessions.onChanged.addListener(() => {
   restoredAt = Date.now();
   dlog('sessions.onChanged', {});
@@ -328,8 +342,19 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   let prevActiveId = activeTab[tab.windowId];
   persistState();
 
+  if (Date.now() < restoringUntil) {
+    restoringUntil = Math.max(restoringUntil, Date.now() + RESTORE_QUIET_MS);
+    dlog('onCreated during startup restore: untouched', { tabId: tab.id });
+    return;
+  }
+
   await Promise.all([cfgReady, stateReady]);
   if (!cfg.enabled) return;
+  // An opener-less tab created already inside a group (Ctrl+Shift+T of a
+  // grouped tab, "New tab in group", a late restore) is where the browser or
+  // user deliberately put it. Link clicks from a grouped opener also arrive
+  // grouped, but those keep the user's positioning rule.
+  const groupedOnArrival = tab.openerTabId == null && (tab.groupId ?? NO_GROUP) !== NO_GROUP;
 
   // On a cold wake the pre-await read was empty; the hydrated maps know better.
   if (prevActiveId == null) {
@@ -367,7 +392,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   // Positioning — for linkClick use opener; for blankNewTab, openerTabId is the tab
   // that was active when Cmd+T was pressed, so use it as the reference too.
   const pos = cfg.positioning[trigger] ?? 'default';
-  if (pos !== 'default') {
+  if (pos !== 'default' && !groupedOnArrival) {
     const refId = tab.openerTabId ?? prevActiveId ?? null;
     const idx = await computeTargetIndex(tab, pos, refId);
     await safeMove(tab.id, idx);
