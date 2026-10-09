@@ -6,6 +6,7 @@ const NTP_URLS = IS_FIREFOX
   ? ['about:newtab', 'about:home', 'about:blank']
   : ['chrome://newtab/'];
 const NO_GROUP = -1;
+const NO_SPLIT = -1;   // tab.splitViewId outside a split (Chrome 155+; undefined before)
 
 const DEFAULTS = {
   positioning: { linkClick: 'right', blankNewTab: 'right', reopened: 'right' },
@@ -319,14 +320,27 @@ async function computeTargetIndex(tab, pos, refId) {
 
   // Resolve reference tab (opener for link clicks, active tab for blank new tabs)
   let refIdx = tab.index;
+  let ref = null;
   try {
     if (refId != null) {
-      refIdx = (await chrome.tabs.get(refId)).index;
+      ref = await chrome.tabs.get(refId);
     } else {
       const [active] = await chrome.tabs.query({ windowId: tab.windowId, active: true });
-      if (active && active.id !== tab.id) refIdx = active.index;
+      if (active && active.id !== tab.id) ref = active;
     }
   } catch {}
+  if (ref) refIdx = ref.index;
+
+  // A Split View pair is one unit: landing between its halves breaks the
+  // split, so 'right' references the pair's right edge and 'left' its left edge.
+  if (ref && (ref.splitViewId ?? NO_SPLIT) !== NO_SPLIT) {
+    try {
+      const pair = (await chrome.tabs.query({ windowId: tab.windowId }))
+        .filter(t => t.splitViewId === ref.splitViewId && t.id !== tab.id)
+        .map(t => t.index);
+      if (pair.length) refIdx = pos === 'right' ? Math.max(...pair) : Math.min(...pair);
+    } catch {}
+  }
 
   // Adjustment needed because moving a tab shifts others:
   // If new tab is left of ref, removing it shifts ref one step left.
@@ -355,6 +369,9 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   // user deliberately put it. Link clicks from a grouped opener also arrive
   // grouped, but those keep the user's positioning rule.
   const groupedOnArrival = tab.openerTabId == null && (tab.groupId ?? NO_GROUP) !== NO_GROUP;
+  // "Open link in split view" creates the tab already paired with its opener;
+  // moving it would break the split it was made for.
+  const splitOnArrival = (tab.splitViewId ?? NO_SPLIT) !== NO_SPLIT;
 
   // On a cold wake the pre-await read was empty; the hydrated maps know better.
   if (prevActiveId == null) {
@@ -392,7 +409,7 @@ chrome.tabs.onCreated.addListener(async (tab) => {
   // Positioning — for linkClick use opener; for blankNewTab, openerTabId is the tab
   // that was active when Cmd+T was pressed, so use it as the reference too.
   const pos = cfg.positioning[trigger] ?? 'default';
-  if (pos !== 'default' && !groupedOnArrival) {
+  if (pos !== 'default' && !groupedOnArrival && !splitOnArrival) {
     const refId = tab.openerTabId ?? prevActiveId ?? null;
     const idx = await computeTargetIndex(tab, pos, refId);
     await safeMove(tab.id, idx);
